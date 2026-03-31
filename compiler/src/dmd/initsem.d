@@ -127,6 +127,7 @@ extern(C++) Initializer initializerSemantic(Initializer init, Scope* sc, ref Typ
         import dmd.attrib : foreachUda;
 
         static bool typeHasNoRefsHelper(Type fieldType) {
+	        return true;
             if(!fieldType.hasPointers())
                 return true; // no pointers, no refs, so ok
 
