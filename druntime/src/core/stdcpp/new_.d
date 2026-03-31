@@ -37,9 +37,12 @@ extern (C++, "std")
     ///
     class bad_alloc : exception
     {
-    @nogc:
-        ///
-        this() { super("bad allocation", 1); }
+	    version(Emscripten){
+		    this()@nogc;
+	    }else{
+		    @nogc:
+			    this() { super("bad allocation", 1); }
+	    }
     }
 }
 

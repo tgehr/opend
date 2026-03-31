@@ -384,7 +384,12 @@ char* thisExePath() @system
 {
     version (linux)
     {
-        return readLink("/proc/self/exe");
+        version(WebAssembly){
+            import core.stdc.string : strdup;
+            return strdup("/home/silq/silq");
+        }else{
+            return readLink("/proc/self/exe");
+        }
     }
     else version (Solaris)
     {

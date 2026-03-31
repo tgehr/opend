@@ -1720,12 +1720,12 @@ else
             result = (result ^ x) * m;
         }
         import core.time : MonoTime;
-	version(Emscripten) {} else {
-        import core.thread : getpid, Thread;
+        version(Emscripten) {} else {
+            import core.thread : getpid, Thread;
 
-        updateResult(cast(ulong) cast(void*) Thread.getThis());
-        updateResult(cast(ulong) getpid());
-	}
+            updateResult(cast(ulong) cast(void*) Thread.getThis());
+            updateResult(cast(ulong) getpid());
+        }
         updateResult(cast(ulong) MonoTime.currTime.ticks);
         result = (result ^ (result >>> 47)) * m;
         return result ^ (result >>> 47);
@@ -1774,6 +1774,20 @@ else
 
 version (linux)
 {
+    version(Emscripten){
+        import core.sys.posix.sys.types : ssize_t;
+        extern(C) ssize_t getrandom(
+            void* buf,
+            size_t buflen,
+            uint flags,
+        ) @system nothrow @nogc{
+            auto ubytes=cast(ubyte[])buf[0..buflen];
+            foreach(i,ref x;ubytes){
+                x=cast(ubyte)((i+23)*17+19); // TODO: get entropy from JS?
+            }
+            return buflen;
+        }
+    }else
     // `getrandom()` was introduced in Linux 3.17.
 
     // Shim for missing bindings in druntime

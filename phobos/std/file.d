@@ -3500,7 +3500,11 @@ else version (Posix) string getcwd() @trusted
     }
     else version (linux)
     {
-        return readLink("/proc/self/exe");
+        version(WebAssembly){
+            return "/home/silq/silq";
+        }else{
+            return readLink("/proc/self/exe");
+        }
     }
     else version (Windows)
     {
@@ -5387,8 +5391,8 @@ string tempDir() @trusted
             DWORD len = GetTempPathW(buf.length, buf.ptr);
             if (len) cache = buf[0 .. len].to!string;
         }
-	else version (Emscripten)
-		assert(0, "function std.file.tempDir not implemented on Emscripten");
+        else version (Emscripten)
+	        assert(0, "function std.file.tempDir not implemented on Emscripten");
         else version (Posix)
         {
             import std.process : environment;
