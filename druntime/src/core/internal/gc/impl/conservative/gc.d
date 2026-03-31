@@ -3034,7 +3034,7 @@ struct Gcx
                 if(!gcCollectQueued) {
                     emscripten_async_call(&__d_gcFromEmscripten, null, 0);
                     gcCollectQueued = true;
-                    printf("Queuing GC\n");
+                    //printf("Queuing GC\n");
                 }
                 return 0;
             }
@@ -5173,8 +5173,8 @@ version(Emscripten) {
         gcCollectQueued = false;
         webassemblyStackIsEmpty = false;
 
-        import core.stdc.stdio;
-        printf("GC collection complete.\n");
+        //import core.stdc.stdio;
+        //printf("GC collection complete.\n");
     }
 
     extern(C)
