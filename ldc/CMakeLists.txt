@@ -1118,8 +1118,12 @@ add_test(NAME build-ldc2-unittest COMMAND "${CMAKE_COMMAND}" --build ${CMAKE_BIN
 add_test(NAME ldc2-unittest COMMAND ${LDC_UNITTEST_EXE_FULL} --version)
 set_tests_properties(ldc2-unittest PROPERTIES DEPENDS build-ldc2-unittest)
 
-if(EXISTS "${PROJECT_SOURCE_DIR}/../druntime/src/object.d")
+option(LDC_BUILD_RUNTIME "Build druntime/phobos" ON)
+
+if(LDC_BUILD_RUNTIME AND EXISTS "${PROJECT_SOURCE_DIR}/../druntime/src/object.d")
     add_subdirectory(runtime)
+elseif(NOT LDC_BUILD_RUNTIME)
+    message(STATUS "Skipping runtime build (LDC_BUILD_RUNTIME=OFF)")
 else()
     message(STATUS "Runtime file ../druntime/src/object.d not found, will build ldc binaries but not the standard library.")
 endif()
