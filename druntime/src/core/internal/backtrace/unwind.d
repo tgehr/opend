@@ -127,7 +127,11 @@ else
 
 struct _Unwind_Context;
 
-_Unwind_Reason_Code _Unwind_RaiseException(_Unwind_Exception *exception_object);
+version(Emscripten) {
+    void __throw_exception_with_stack_trace(_Unwind_Exception *exception_object);
+} else {
+    _Unwind_Reason_Code _Unwind_RaiseException(_Unwind_Exception *exception_object);
+}
 
 alias _Unwind_Stop_Fn = _Unwind_Reason_Code function(
         int _version,

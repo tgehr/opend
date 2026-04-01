@@ -101,8 +101,8 @@ else version (LoongArch64)
 }
 else version (WebAssembly)
 {
-	// FIXME this is just random nonsense to make it compile
-	// it is totally non-functional i think
+    // FIXME this is just random nonsense to make it compile
+    // it is totally non-functional i think
     enum eh_exception_regno = 0;
     enum eh_selector_regno = 2;
 }
@@ -269,7 +269,7 @@ struct ExceptionHeader
 // LDC: renamed from __dmd_begin_catch
 extern(C) Throwable __dmd_begin_catch(_Unwind_Exception* exceptionObject)
 {
-	return _d_eh_enter_catch(exceptionObject);
+    return _d_eh_enter_catch(exceptionObject);
 }
 extern(C) Throwable _d_eh_enter_catch(_Unwind_Exception* exceptionObject)
 {
@@ -321,7 +321,7 @@ extern(C) void* _d_eh_swapContextDwarf(void* newContext) nothrow @nogc
 // LDC: renamed from _d_throwdwarf
 extern(C) void _d_throwdwarf(Throwable o)
 {
-	_d_throw_exception(o);
+    _d_throw_exception(o);
 }
 extern(C) void _d_throw_exception(Throwable o)
 {
@@ -368,7 +368,12 @@ extern(C) void _d_throw_exception(Throwable o)
     }
     else
     {
-        auto r = _Unwind_RaiseException(&eh.exception_object);
+        version(Emscripten){
+            __throw_exception_with_stack_trace(&eh.exception_object);
+            auto r = _URC_END_OF_STACK;
+        }else{
+            auto r = _Unwind_RaiseException(&eh.exception_object);
+        }
     }
 
     /* Shouldn't have returned, but if it did:
@@ -488,7 +493,7 @@ version (ARM_EABI_UNWINDER)
         UNWIND_POINTER_REG = 12,
         UNWIND_STACK_REG = 13
     }
-    
+
     extern (C) _Unwind_Reason_Code _d_eh_personality(_Unwind_State state,
                    _Unwind_Exception* exceptionObject, _Unwind_Context* context)
     {
@@ -556,7 +561,7 @@ extern (C) _Unwind_Reason_Code __dmd_personality_v0(int ver, _Unwind_Action acti
                _Unwind_Exception_Class exceptionClass, _Unwind_Exception* exceptionObject,
                _Unwind_Context* context)
 {
-	return _d_eh_personality_common(actions, exceptionClass, exceptionObject, context);
+    return _d_eh_personality_common(actions, exceptionClass, exceptionObject, context);
 }
 
 
