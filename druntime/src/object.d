@@ -2734,7 +2734,7 @@ class Throwable : Object
         this.file = file;
         this.line = line;
         //this.info = _d_traceContext();
-        if(!__ctfe){
+        /+if(!__ctfe){
 	        import core.stdc.stdio;
 	        static void foo(string msg,string file,size_t line){
 		        printf("exception at %*s:%d: %*s\n",cast(int)file.length,file.ptr,cast(int)line,cast(int)msg.length,msg.ptr);
@@ -2742,7 +2742,7 @@ class Throwable : Object
 	        ()@trusted{
 		        (cast(void function(string,string,size_t)@nogc @safe pure nothrow)&foo)(msg,file,line);
 	        }();
-        }
+        }+/
     }
 
     @trusted nothrow ~this()

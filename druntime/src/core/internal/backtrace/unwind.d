@@ -128,7 +128,14 @@ else
 struct _Unwind_Context;
 
 version(Emscripten) {
-    void __throw_exception_with_stack_trace(_Unwind_Exception *exception_object);
+    // Throws a D Throwable via the Wasm 'throw 0' instruction so it can be
+    // caught by 'catch 0' blocks emitted by trycatchfinally.cpp.
+    // Implemented in druntime's eh_wasm.c via __builtin_wasm_throw.
+    void _d_wasm_throw(void* throwable);
+    // Called from _d_eh_enter_catch in the catch body.
+    // With new-style Wasm EH, llvm.wasm.get.exception returns the raw
+    // Throwable pointer, so this is a pass-through.
+    void* _d_wasm_begin_catch(void* exception_object);
 } else {
     _Unwind_Reason_Code _Unwind_RaiseException(_Unwind_Exception *exception_object);
 }

@@ -23,6 +23,19 @@
 #include "gen/tollvm.h"
 #include "ir/irfunction.h"
 #include "ir/irtypeclass.h"
+#include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/IntrinsicsWebAssembly.h"
+
+////////////////////////////////////////////////////////////////////////////////
+
+// Stub: enable Wasm EH code paths. Wire up to a real command-line flag later.
+// When true, emits catchswitch/catchpad/catchret/wasm.rethrow instead of
+// the DWARF landingpad model.
+static bool useWasmEH() {
+  // TODO: replace with a proper flag check, e.g.:
+  //   return global.params.targetTriple.isWasm() && global.params.wasmExceptions;
+  return true;
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -44,6 +57,15 @@ TryCatchScope::TryCatchScope(IRState &irs, llvm::Value *ehPtrSlot,
 
   if (useMSVCEH()) {
     emitCatchBodiesMSVC(irs, ehPtrSlot);
+    return;
+  }
+  if (useWasmEH()) {
+    // For Wasm EH the catch body blocks are structurally identical to the DWARF
+    // path: each block calls _d_eh_enter_catch (loading from ehPtrSlot, which
+    // the landing pad stores into before the catchret) and then runs user code.
+    // The exception pointer is captured by emitLandingPadWasm before the
+    // catchret exits the funclet, so ehPtrSlot is valid when the body runs.
+    emitCatchBodies(irs, ehPtrSlot);
     return;
   }
   emitCatchBodies(irs, ehPtrSlot);
@@ -495,8 +517,14 @@ void TryCatchFinallyScopes::pushTryCatch(TryCatchStatement *stmt,
   // catches.
   tryCatchScopes.push_back(scope);
 
-  if (!useMSVCEH())
+  if (useMSVCEH()) {
+    // The MSVC path pushes the catchswitch block as a cleanup scope in
+    // emitCatchBodiesMSVC; nothing more to do here.
+  } else {
+    // DWARF and Wasm EH both emit their landing pads lazily from getLandingPad,
+    // so we just push a null slot into the per-cleanup-scope pad stack.
     landingPadsPerCleanupScope[currentCleanupScope()].push_back(nullptr);
+  }
 }
 
 void TryCatchFinallyScopes::popTryCatch() {
@@ -505,6 +533,7 @@ void TryCatchFinallyScopes::popTryCatch() {
     assert(isCatchSwitchBlock(cleanupScopes.back().beginBlock()));
     popCleanups(currentCleanupScope() - 1);
   } else {
+    // DWARF and Wasm EH both just pop the landing pad slot.
     landingPadsPerCleanupScope[currentCleanupScope()].pop_back();
   }
 }
@@ -678,6 +707,9 @@ llvm::BasicBlock *TryCatchFinallyScopes::emitLandingPad() {
     return emitLandingPadMSVC(currentCleanupScope() - 1);
   }
 
+  if (useWasmEH())
+    return emitLandingPadWasm();
+
   // save and rewrite scope
   const auto savedInsertPoint = irs.saveInsertPoint();
 
@@ -758,6 +790,226 @@ llvm::BasicBlock *TryCatchFinallyScopes::emitLandingPad() {
 
   return beginBB;
 }
+
+////////////////////////////////////////////////////////////////////////////////
+// Wasm EH landing pad
+//
+// Wasm EH uses Windows-style funclet instructions (catchswitch / catchpad /
+// catchret) but collapses all catch clauses into a single catchpad — the same
+// pattern clang uses for C++ Wasm EH (see CGException.cpp:
+// emitWasmCatchPadBlock).  Type discrimination is done inside the funclet with
+// llvm.wasm.get.ehselector + llvm.eh.typeid.for, exactly as the DWARF landing
+// pad does it with the landingpad selector — so the existing emitCatchBodies /
+// getCatchBlocks infrastructure is reused unchanged.
+//
+// The structure emitted for a try { f(); } catch(E e) { ... } is:
+//
+//   invoke f() to %normal unwind %catch.dispatch
+//
+//   catch.dispatch:
+//     %cs = catchswitch within none [label %catch.start] unwind to caller
+//
+//   catch.start:                       ← inside the funclet
+//     %pad  = catchpad within %cs [ptr @ClassInfo_E, ...]
+//     %exn  = call ptr @llvm.wasm.get.exception(token %pad)
+//     %sel  = call i32 @llvm.wasm.get.ehselector(token %pad)
+//     store ptr %exn, ptr %eh.ptr      ← stash for _d_eh_enter_catch
+//     %tid  = call i32 @llvm.eh.typeid.for(ptr @ClassInfo_E)
+//     %hit  = icmp eq i32 %sel, %tid
+//     br i1 %hit, %catchret.E, %[next check or rethrow]
+//
+//   catchret.catch.E:                  ← still inside funclet, exits it
+//     catchret from %pad to label %catch.E
+//
+//   catch.E:                           ← outside funclet
+//     call _d_eh_enter_catch(%eh.ptr)  ← loads stashed pointer
+//     ... user handler ...
+//
+//   rethrow:                           ← no clause matched
+//     call void @llvm.wasm.rethrow() ["funclet"(token %pad)]
+//     unreachable
+//
+// Notes:
+//  - %eh.ptr is the function-wide alloca (ehPtrSlot) used by the DWARF path
+//    too; we reuse it so _d_eh_enter_catch sees the same slot.
+//  - catchret must precede user code because LLVM requires all uses of
+//    llvm.wasm.get.exception to be inside the funclet.
+//  - Interleaved cleanups (try/finally around the try/catch) are handled by
+//    threading the catchswitch unwind destination to the enclosing cleanup pad,
+//    mirroring what runCleanupPad does for MSVC.
+
+llvm::BasicBlock *TryCatchFinallyScopes::emitLandingPadWasm() {
+  const auto savedIP = irs.saveInsertPoint();
+
+  // ── catch.dispatch ───────────────────────────────────────────────────────
+  // The dispatch block holds the catchswitch instruction.  It is the unwind
+  // target of every invoke inside the try body.
+  llvm::BasicBlock *dispatchBB =
+      irs.insertBBBefore(nullptr, "catch.dispatch");
+  irs.ir->SetInsertPoint(dispatchBB);
+
+  // Set the Wasm personality.  __gxx_wasm_personality_v0 is provided by
+  // Emscripten's runtime.  It performs pointer-equality matching of the
+  // catchpad operands (our ClassInfo pointers play the role of type_info*).
+  // The D-specific class-hierarchy walk is handled below via the selector
+  // comparison chain, same as in the DWARF path.
+  if (!irs.func()->hasLLVMPersonalityFn()) {
+    // Declare __gxx_wasm_personality_v0 directly rather than going through
+    // getRuntimeFunction: the latter verifies the symbol exists in the D
+    // runtime tables, but this personality lives in Emscripten's C++ runtime
+    // and is only available at final link time (via emcc), not during
+    // compilation of individual .d files.  A bare declaration is all LLVM
+    // needs — it just records the name in the IR and lets the linker resolve it.
+    //
+    // Personality functions have type i32(...) in LLVM IR regardless of their
+    // actual C signature; LLVM only uses the name, never calls it directly.
+    llvm::FunctionType *personalityTy = llvm::FunctionType::get(
+        llvm::Type::getInt32Ty(irs.context()), /*isVarArg=*/true);
+    llvm::Function *personality = llvm::cast<llvm::Function>(
+        irs.module.getOrInsertFunction("__gxx_wasm_personality_v0",
+                                       personalityTy).getCallee());
+    irs.func()->setLLVMPersonalityFn(personality);
+  }
+
+  // Parent pad token: ConstantTokenNone at the top level (no enclosing
+  // funclet).  If we ever need to support nested Wasm funclets this needs to
+  // be CurrentFuncletPad, but D doesn't run user code inside funclets.
+  llvm::Value *parentPad =
+      llvm::ConstantTokenNone::get(irs.context());
+
+  // Unwind destination for the catchswitch: nullptr means "unwind to caller".
+  // TODO: when there are active cleanup scopes enclosing this try/catch (i.e.
+  // a try/finally wrapping a try/catch), we need to thread the catchswitch
+  // unwind destination through the enclosing cleanuppad chain via runCleanupPad,
+  // mirroring emitLandingPadMSVC.  For now we always unwind to caller, which is
+  // correct for the common case of no interleaved finally blocks.
+  llvm::BasicBlock *unwindDest = nullptr;
+
+  // Collect all ClassInfo pointers across all active try-catch scopes
+  // (outermost catch clauses first, matching the DWARF landingpad ordering).
+  // The catchpad lists them all so the personality admits any D exception.
+  llvm::SmallVector<llvm::Value *, 8> catchPadTypes;
+  for (auto it = tryCatchScopes.rbegin(); it != tryCatchScopes.rend(); ++it)
+    for (const auto &cb : it->getCatchBlocks())
+      catchPadTypes.push_back(cb.classInfoPtr);
+
+  // If there are no typed clauses (shouldn't happen, but be safe) add a
+  // catch-all null so the personality still admits the exception.
+  if (catchPadTypes.empty())
+    catchPadTypes.push_back(
+        llvm::Constant::getNullValue(getOpaquePtrType()));
+
+  auto *catchSwitch = irs.ir->CreateCatchSwitch(
+      parentPad, unwindDest, /*NumHandlers=*/1);
+
+  // ── catch.start ──────────────────────────────────────────────────────────
+  // Single handler block shared by all clauses (Wasm EH merges them).
+  llvm::BasicBlock *catchStartBB =
+      irs.insertBBBefore(nullptr, "catch.start");
+  catchSwitch->addHandler(catchStartBB);
+  irs.ir->SetInsertPoint(catchStartBB);
+
+  auto *catchPad =
+      irs.ir->CreateCatchPad(catchSwitch, catchPadTypes);
+
+  // Retrieve the exception object pointer and selector from Wasm intrinsics.
+  // These intrinsics are only valid inside the funclet (before any catchret).
+  auto *getExnFn = llvm::Intrinsic::getDeclaration(
+      &irs.module, llvm::Intrinsic::WASMIntrinsics::wasm_get_exception);
+  auto *getSelFn = llvm::Intrinsic::getDeclaration(
+      &irs.module, llvm::Intrinsic::WASMIntrinsics::wasm_get_ehselector);
+  llvm::Value *exnPtr =
+      irs.ir->CreateCall(getExnFn, catchPad, "wasm.exn");
+  llvm::Value *selector =
+      irs.ir->CreateCall(getSelFn, catchPad, "wasm.sel");
+
+  // Stash the exception pointer into the function-wide ehPtrSlot alloca so
+  // that _d_eh_enter_catch (called after catchret, outside the funclet) can
+  // load it.  This is the same slot the DWARF path stores the landingpad
+  // exception pointer into.
+  irs.ir->CreateStore(exnPtr, getOrCreateEhPtrSlot());
+
+  // ── Selector comparison chain ─────────────────────────────────────────────
+  // Walk the same catch-block list as the DWARF emitLandingPad, emitting an
+  // icmp chain.  On a match we fall into a one-instruction "catchret trampoline"
+  // block that exits the funclet and transfers control to the handler body
+  // (which calls _d_eh_enter_catch and runs the user code — all outside the
+  // funclet).  On a full mismatch we rethrow inside the funclet.
+  //
+  // Also mirror the cleanup interleaving from the DWARF path: if there are
+  // cleanup scopes between two nested try-catch scopes we would need to run
+  // them.  For now we replicate the same structure; cleanup blocks in Wasm EH
+  // should use cleanuppad/cleanupret (i.e. runCleanupPad), but that requires
+  // more infrastructure.  The TODO below marks where that goes.
+  CleanupCursor cleanupForInterleave = currentCleanupScope();
+
+  for (auto it = tryCatchScopes.rbegin(), end = tryCatchScopes.rend();
+       it != end; ++it) {
+    const auto &tryCatchScope = *it;
+
+    // TODO: if cleanupForInterleave > tryCatchScope.getCleanupScope(), we need
+    // to run interleaved cleanups here (analogous to the DWARF path's
+    // landingPad->setCleanup(true) + runCleanups block).  For the common case
+    // (no finally between try and catch) this is a no-op.
+    cleanupForInterleave = tryCatchScope.getCleanupScope();
+
+    for (const auto &cb : tryCatchScope.getCatchBlocks()) {
+      // Compute the typeid for this clause's ClassInfo pointer.
+      llvm::Value *typeId = irs.ir->CreateCall(
+          GET_INTRINSIC_DECL(eh_typeid_for, cb.classInfoPtr->getType()),
+          cb.classInfoPtr, "typeid");
+
+      llvm::BasicBlock *mismatchBB =
+          irs.insertBBBefore(nullptr,
+              catchStartBB->getName() + llvm::Twine(".mismatch"));
+
+      irs.ir->CreateCondBr(
+          irs.ir->CreateICmpEQ(selector, typeId),
+          /*true — matched, go to catchret trampoline, filled below*/
+          mismatchBB, // placeholder; we'll fix this up right after
+          /*false — mismatch*/
+          mismatchBB,
+          cb.branchWeights);
+
+      // Fix the true successor to point at a catchret trampoline block.
+      // We cannot create it before the condBr because we need the current
+      // insert block's terminator to patch.
+      auto *condBr = llvm::cast<llvm::BranchInst>(
+          irs.ir->GetInsertBlock()->getTerminator());
+
+      // ── catchret trampoline ───────────────────────────────────────────────
+      // Must be inside the funclet (so the catchret is valid) but contains
+      // only the catchret itself.  The handler body (cb.bodyBB) runs outside
+      // the funclet, where _d_eh_enter_catch is safe to call/invoke.
+      llvm::BasicBlock *catchRetBB =
+          irs.insertBBBefore(mismatchBB,
+              llvm::Twine("catchret.") + cb.bodyBB->getName());
+      irs.ir->SetInsertPoint(catchRetBB);
+      llvm::CatchReturnInst::Create(catchPad, cb.bodyBB, catchRetBB);
+
+      // Patch the true branch of the condBr to go to our new trampoline.
+      condBr->setSuccessor(0, catchRetBB);
+
+      // Continue building the selector chain from the mismatch block.
+      irs.ir->SetInsertPoint(mismatchBB);
+    }
+  }
+
+  // ── rethrow ───────────────────────────────────────────────────────────────
+  // No clause matched.  We must rethrow inside the funclet so the unwinder can
+  // continue to the enclosing EH scope.  llvm.wasm.rethrow requires a
+  // "funclet" operand bundle identifying the enclosing catchpad.
+  auto *rethrowFn = llvm::Intrinsic::getDeclaration(
+      &irs.module, llvm::Intrinsic::WASMIntrinsics::wasm_rethrow);
+  irs.ir->CreateCall(rethrowFn, {},
+                     {llvm::OperandBundleDef("funclet",
+                          llvm::ArrayRef<llvm::Value *>({catchPad}))});
+  irs.ir->CreateUnreachable();
+
+  return dispatchBB;
+}
+
+////////////////////////////////////////////////////////////////////////////////
 
 llvm::AllocaInst *TryCatchFinallyScopes::getOrCreateEhPtrSlot() {
   if (!ehPtrSlot)

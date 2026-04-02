@@ -273,24 +273,36 @@ extern(C) Throwable __dmd_begin_catch(_Unwind_Exception* exceptionObject)
 }
 extern(C) Throwable _d_eh_enter_catch(_Unwind_Exception* exceptionObject)
 {
-    version (ARM_EABI_UNWINDER)
+    version (Emscripten)
     {
-        _Unwind_Complete(exceptionObject);
+        // On Emscripten, exceptions are thrown via __cxa_throw wrapping the
+        // Throwable pointer (not via _Unwind_RaiseException wrapping an
+        // ExceptionHeader).  The landing pad's exception pointer is the raw
+        // value from the catch_all block, which __cxa_begin_catch uses to
+        // recover our thrown object (a void* holding the Throwable pointer).
+        return cast(Throwable)_d_wasm_begin_catch(cast(void*)exceptionObject);
     }
-    ExceptionHeader *eh = ExceptionHeader.toExceptionHeader(exceptionObject);
-    debug (EH_personality) writeln("__dmd_begin_catch(%p), object = %p", eh, eh.object);
+    else
+    {
+        version (ARM_EABI_UNWINDER)
+        {
+            _Unwind_Complete(exceptionObject);
+        }
+        ExceptionHeader *eh = ExceptionHeader.toExceptionHeader(exceptionObject);
+        debug (EH_personality) writeln("__dmd_begin_catch(%p), object = %p", eh, eh.object);
 
-    auto o = eh.object;
-    // Remove our reference to the exception. We should not decrease its refcount,
-    // because we pass the object on to the caller.
-    eh.object = null;
+        auto o = eh.object;
+        // Remove our reference to the exception. We should not decrease its refcount,
+        // because we pass the object on to the caller.
+        eh.object = null;
 
-    // Pop off of chain
-    if (eh != ExceptionHeader.pop())
-        terminate(__LINE__);                      // eh should have been at top of stack
+        // Pop off of chain
+        if (eh != ExceptionHeader.pop())
+            terminate(__LINE__);                      // eh should have been at top of stack
 
-    _Unwind_DeleteException(&eh.exception_object);      // done with eh
-    return o;
+        _Unwind_DeleteException(&eh.exception_object);      // done with eh
+        return o;
+    }
 }
 
 /****************************************
@@ -369,7 +381,12 @@ extern(C) void _d_throw_exception(Throwable o)
     else
     {
         version(Emscripten){
-            __throw_exception_with_stack_trace(&eh.exception_object);
+            // Bypass the ExceptionHeader/_Unwind_Exception machinery entirely.
+            // _d_wasm_throw allocates a __cxa_exception via __cxa_allocate_exception,
+            // stores the Throwable pointer inside it, and calls __cxa_throw.
+            // This is caught by catch_all landing pads, and _d_wasm_begin_catch
+            // recovers the Throwable pointer via __cxa_begin_catch.
+            _d_wasm_throw(cast(void*)o);
             auto r = _URC_END_OF_STACK;
         }else{
             auto r = _Unwind_RaiseException(&eh.exception_object);
@@ -564,6 +581,28 @@ extern (C) _Unwind_Reason_Code __dmd_personality_v0(int ver, _Unwind_Action acti
     return _d_eh_personality_common(actions, exceptionClass, exceptionObject, context);
 }
 
+version (Emscripten)
+{
+    /* On Emscripten, _Unwind_CallPersonality always calls __gxx_personality_wasm0
+     * with a synthetic context:
+     *   context[0] = ip = 0
+     *   context[4] = LSDA pointer (GCC_except_table for this catch site)
+     *   context[8] = result slot (written by _Unwind_SetGR(context, 1, value))
+     * and exceptionObject = raw Throwable pointer (from 'throw 0').
+     *
+     * We delegate to _d_eh_personality_common which scans the LSDA to find
+     * the matching catch clause and calls _d_isbaseof for type matching.
+     * The ip is 0 (not decremented — see below) so the call site table entry
+     * at cs_start=0 matches.
+     */
+    extern (C) int __gxx_personality_wasm0(int ver, _Unwind_Action actions,
+                   _Unwind_Exception_Class exceptionClass, _Unwind_Exception* exceptionObject,
+                   _Unwind_Context* context)
+    {
+        return _d_eh_personality_common(actions, dmdExceptionClass, exceptionObject, context);
+    }
+}
+
 
 extern (C) _Unwind_Reason_Code _d_eh_personality_common(_Unwind_Action actions,
                _Unwind_Exception_Class exceptionClass, _Unwind_Exception* exceptionObject,
@@ -613,6 +652,14 @@ extern (C) _Unwind_Reason_Code _d_eh_personality_common(_Unwind_Action actions,
         if (!ip_before_insn)
             --ip;
     }
+    else version (Emscripten)
+    {
+        // _Unwind_GetIP returns context[0] + 2 (Emscripten's implementation adds 2).
+        // _Unwind_CallPersonality stores 0 in context[0], so _Unwind_GetIP returns 2.
+        // The LSDA call site table has cs_start=0, cs_len=1, so we need ip-Start=0.
+        // Subtract 2 to get ip=0 matching the call site entry.
+        auto ip = _Unwind_GetIP(context) - 2;
+    }
     else
     {
         auto ip = _Unwind_GetIP(context);
@@ -653,6 +700,16 @@ extern (C) _Unwind_Reason_Code _d_eh_personality_common(_Unwind_Action actions,
             debug (EH_personality) writeln("  cleanup");
             if (actions & _UA_SEARCH_PHASE)
             {
+                version (Emscripten)
+                {
+                    // With old-style Wasm EH lowering, emcc generates cleanup-only
+                    // LSDAs (cs_action=0) for ALL catch blocks including typed ones.
+                    // The catch_all instruction accepts everything, so we signal a
+                    // match unconditionally. Type discrimination happens outside the
+                    // personality (the catch body re-throws if type doesn't match).
+                    _Unwind_SetGR(context, 1, 1);
+                    return _URC_HANDLER_FOUND;
+                }
                 return _URC_CONTINUE_UNWIND;
             }
             break;
@@ -662,7 +719,13 @@ extern (C) _Unwind_Reason_Code _d_eh_personality_common(_Unwind_Action actions,
             assert(!(actions & _UA_FORCE_UNWIND));
             if (actions & _UA_SEARCH_PHASE)
             {
-                if (exceptionClass == dmdExceptionClass)
+                version (Emscripten)
+                {
+                    // _Unwind_CallPersonality ignores the return value and
+                    // checks context+8 (regno=1) for the match result.
+                    _Unwind_SetGR(context, 1, 1);
+                }
+                else if (exceptionClass == dmdExceptionClass)
                 {
                     version (ARM_EABI_UNWINDER)
                     {
@@ -681,7 +744,10 @@ extern (C) _Unwind_Reason_Code _d_eh_personality_common(_Unwind_Action actions,
 
     debug (EH_personality) writeln("  lsda = %p, landing_pad = %p, handler = %d", language_specific_data, landing_pad, handler);
 
-    // Figure out what to do when there are multiple exceptions in flight
+    // Figure out what to do when there are multiple exceptions in flight.
+    // On Emscripten, exceptionObject is the raw Throwable pointer — not an
+    // ExceptionHeader — so skip the chaining logic entirely.
+    version (Emscripten) {} else
     if (exceptionClass == dmdExceptionClass)
     {
         auto eh = ExceptionHeader.toExceptionHeader(exceptionObject);
@@ -765,29 +831,36 @@ extern (C) _Unwind_Reason_Code _d_eh_personality_common(_Unwind_Action actions,
  */
 ClassInfo getClassInfo(_Unwind_Exception* exceptionObject, const(ubyte)* currentLsd)
 {
-    ExceptionHeader* eh = ExceptionHeader.toExceptionHeader(exceptionObject);
-    Throwable ehobject = eh.object;
-    debug (EH_personality) writeln("start: %p '%.*s'", ehobject, cast(int)(typeid(ehobject).info.name.length), ehobject.classinfo.info.name.ptr);
-    for (ExceptionHeader* ehn = eh.next; ehn; ehn = ehn.next)
+    version (Emscripten)
     {
-        // like __dmd_personality_v0, don't combine when the exceptions are from different functions
-        // Fixes "exception thrown and caught while inside finally block"
-        // https://issues.dlang.org/show_bug.cgi?id=19831
-        if (currentLsd != ehn.languageSpecificData)
-        {
-            debug (EH_personality) writeln("break: %p %p", currentLsd, ehn.languageSpecificData);
-            break;
-        }
-
-        debug (EH_personality) writeln("ehn =   %p '%.*s'", ehn.object, cast(int)(typeid(ehn.object).info.name.length), ehn.object.classinfo.info.name.ptr);
-        Error e = cast(Error)ehobject;
-        if (e is null || (cast(Error)ehn.object) !is null)
-        {
-            ehobject = ehn.object;
-        }
+        // On Emscripten, exceptionObject is the raw Throwable pointer thrown
+        // via 'throw 0' — not an ExceptionHeader.  Cast it directly.
+        Throwable ehobject = cast(Throwable)cast(void*)exceptionObject;
+        return typeid(ehobject);
     }
-    debug (EH_personality) writeln("end  : %p", ehobject);
-    return typeid(ehobject);
+    else
+    {
+        ExceptionHeader* eh = ExceptionHeader.toExceptionHeader(exceptionObject);
+        Throwable ehobject = eh.object;
+        debug (EH_personality) writeln("start: %p '%.*s'", ehobject, cast(int)(typeid(ehobject).info.name.length), ehobject.classinfo.info.name.ptr);
+        for (ExceptionHeader* ehn = eh.next; ehn; ehn = ehn.next)
+        {
+            if (currentLsd != ehn.languageSpecificData)
+            {
+                debug (EH_personality) writeln("break: %p %p", currentLsd, ehn.languageSpecificData);
+                break;
+            }
+
+            debug (EH_personality) writeln("ehn =   %p '%.*s'", ehn.object, cast(int)(typeid(ehn.object).info.name.length), ehn.object.classinfo.info.name.ptr);
+            Error e = cast(Error)ehobject;
+            if (e is null || (cast(Error)ehn.object) !is null)
+            {
+                ehobject = ehn.object;
+            }
+        }
+        debug (EH_personality) writeln("end  : %p", ehobject);
+        return typeid(ehobject);
+    }
 }
 
 /******************************

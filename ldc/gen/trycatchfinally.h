@@ -306,4 +306,7 @@ private:
                         llvm::BasicBlock *continueWith);
   llvm::BasicBlock *runCleanupPad(CleanupCursor scope,
                                   llvm::BasicBlock *unwindTo);
+
+  // Wasm EH
+  llvm::BasicBlock *emitLandingPadWasm();
 };
