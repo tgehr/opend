@@ -200,6 +200,11 @@ public:
   /// value.
   llvm::AllocaInst *retValSlot = nullptr;
 
+  /// When non-null, we are re-emitting a finally body inside a Wasm EH
+  /// cleanuppad funclet for the unwind path.  callOrInvoke adds a
+  /// ["funclet"(token wasmCleanupPad)] operand bundle to every call/invoke.
+  llvm::Value *wasmCleanupPad = nullptr;
+
   /// Emits a call or invoke to the given callee, depending on whether there
   /// are catches/cleanups active or not.
   llvm::CallBase *callOrInvoke(llvm::Value *callee,

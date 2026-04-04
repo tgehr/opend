@@ -13,6 +13,10 @@
 #include <stddef.h>
 #include <vector>
 
+/// Returns true when targeting Wasm with exception handling enabled.
+/// Used by both trycatchfinally.cpp and statements.cpp.
+bool useWasmEH();
+
 class Identifier;
 struct IRState;
 class TryCatchStatement;
@@ -93,7 +97,12 @@ private:
 /// local variables with destructors, each of which might throw itself).
 class CleanupScope {
 public:
-  CleanupScope(llvm::BasicBlock *beginBlock, llvm::BasicBlock *endBlock);
+  CleanupScope(llvm::BasicBlock *beginBlock, llvm::BasicBlock *endBlock,
+               llvm::BasicBlock *wasmUnwindBB = nullptr);
+
+  /// Pre-built cleanuppad block for Wasm EH unwind path (may be null).
+  /// Set by visit(TryFinallyStatement) when useWasmEH() is true.
+  llvm::BasicBlock *wasmUnwindBB = nullptr;
 
   llvm::BasicBlock *run(IRState &irs, llvm::BasicBlock *sourceBlock,
                         llvm::BasicBlock *continueWith);
@@ -106,6 +115,7 @@ public:
                                llvm::BasicBlock *continueWith,
                                llvm::BasicBlock *unwindTo = nullptr,
                                llvm::Value *funclet = nullptr);
+
 
   llvm::BasicBlock *beginBlock() const { return blocks.front(); }
   llvm::BasicBlock *endBlock() const { return blocks.back(); }
@@ -204,7 +214,8 @@ public:
   /// The end block is expected not to contain a terminator yet. It will be
   /// added as needed, based on what follow-up blocks code from within this
   /// scope will branch to.
-  void pushCleanup(llvm::BasicBlock *beginBlock, llvm::BasicBlock *endBlock);
+  void pushCleanup(llvm::BasicBlock *beginBlock, llvm::BasicBlock *endBlock,
+                   llvm::BasicBlock *wasmUnwindBB = nullptr);
 
   /// Terminates the current basic block with a branch to the cleanups needed
   /// for leaving the current scope and continuing execution at the target

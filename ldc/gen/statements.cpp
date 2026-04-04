@@ -35,8 +35,10 @@
 #include "gen/tollvm.h"
 #include "ir/irfunction.h"
 #include "ir/irmodule.h"
+#include "gen/trycatchfinally.h"    // useWasmEH()
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/InlineAsm.h"
+#include "llvm/IR/Instructions.h"  // CleanupPadInst, CleanupReturnInst
 #include <fstream>
 #include <math.h>
 #include <stdio.h>
@@ -866,9 +868,61 @@ public:
     // For @compute code, don't emit any exception handling as there are no
     // exceptions anyway.
     const bool computeCode = !!irs->dcomputetarget;
+
+    // For Wasm EH, pre-emit the finally body a second time inside a
+    // cleanuppad funclet for the unwind path.  This avoids the domination
+    // issues of trying to clone pre-existing blocks: the re-emitted body has
+    // all its values defined within the funclet.
+    llvm::BasicBlock *wasmCleanupBB = nullptr;
+    if (!computeCode && useWasmEH()) {
+      const auto savedIP = irs->saveInsertPoint();
+      // savedIP restores insert point when it goes out of scope (RAII).
+
+      // Ensure the function has the Wasm personality — required for cleanuppad.
+      // emitLandingPadWasm normally sets this, but may not have run yet.
+      if (!irs->func()->hasLLVMPersonalityFn()) {
+        llvm::FunctionType *personalityTy = llvm::FunctionType::get(
+            llvm::Type::getInt32Ty(irs->context()), /*isVarArg=*/true);
+        llvm::Function *personality = llvm::cast<llvm::Function>(
+            irs->module.getOrInsertFunction("__gxx_wasm_personality_v0",
+                                            personalityTy).getCallee());
+        irs->func()->setLLVMPersonalityFn(personality);
+      }
+
+      // cleanuppad entry block
+      wasmCleanupBB = irs->insertBBBefore(nullptr, "wasm.cleanup");
+      irs->ir->SetInsertPoint(wasmCleanupBB);
+      auto *cp = llvm::CleanupPadInst::Create(
+          llvm::ConstantTokenNone::get(irs->context()), {}, "", wasmCleanupBB);
+
+      // cleanupret exit block — unwinds to caller (nested chains handled later)
+      llvm::BasicBlock *cleanupRetBB =
+          irs->insertBBBefore(nullptr, "wasm.cleanup.ret");
+      irs->ir->SetInsertPoint(cleanupRetBB);
+      llvm::CleanupReturnInst::Create(cp, /*UnwindBB=*/nullptr, cleanupRetBB);
+
+      // Re-emit the finally body inside the funclet with wasmCleanupPad set
+      // so callOrInvoke adds ["funclet"(token cp)] to all calls.
+      // Save/restore in case the finally body itself contains try/finally,
+      // which would otherwise clobber wasmCleanupPad.
+      irs->ir->SetInsertPoint(wasmCleanupBB);
+      auto *savedCleanupPad = irs->funcGen().wasmCleanupPad;
+      irs->funcGen().wasmCleanupPad = cp;
+      irs->DBuilder.EmitBlockStart(stmt->finalbody->loc);
+      stmt->finalbody->accept(this);
+      irs->DBuilder.EmitBlockEnd();
+      irs->funcGen().wasmCleanupPad = savedCleanupPad;
+
+      // Branch from end of re-emitted body to cleanupret.
+      if (!irs->scopereturned())
+        irs->ir->CreateBr(cleanupRetBB);
+      // savedIP goes out of scope here, restoring the insert point.
+    }
+
     if (!computeCode) {
       cleanupBefore = irs->funcGen().scopes.currentCleanupScope();
-      irs->funcGen().scopes.pushCleanup(finallybb, irs->scopebb());
+      irs->funcGen().scopes.pushCleanup(finallybb, irs->scopebb(),
+                                        wasmCleanupBB);
     }
     // Emit the try block.
     irs->ir->SetInsertPoint(trybb);

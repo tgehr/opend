@@ -124,6 +124,20 @@ llvm::CallBase *FuncGenState::callOrInvoke(llvm::Value *callee,
   // calls inside a funclet must be annotated with its value
   llvm::SmallVector<llvm::OperandBundleDef, 2> BundleList;
 
+  // When re-emitting a finally body inside a Wasm EH cleanuppad, use a plain
+  // call (not invoke) with the funclet bundle.  All unwind edges inside a
+  // funclet must share the same destination, so we cannot use invoke here
+  // (it would create a mismatched unwind dest vs the cleanupret).
+  if (wasmCleanupPad) {
+    BundleList.emplace_back("funclet",
+        llvm::ArrayRef<llvm::Value *>(wasmCleanupPad));
+    llvm::FunctionCallee calleeArg(calleeType, callee);
+    auto *call = irs.ir->CreateCall(calleeArg, args, BundleList, name);
+    if (calleeFn)
+      call->setAttributes(calleeFn->getAttributes());
+    return call;
+  }
+
   llvm::FunctionCallee calleeArg(calleeType, callee);
 
   if (doesNotThrow || scopes.empty()) {

@@ -31,7 +31,7 @@
 // Stub: enable Wasm EH code paths. Wire up to a real command-line flag later.
 // When true, emits catchswitch/catchpad/catchret/wasm.rethrow instead of
 // the DWARF landingpad model.
-static bool useWasmEH() {
+bool useWasmEH() {
   // TODO: replace with a proper flag check, e.g.:
   //   return global.params.targetTriple.isWasm() && global.params.wasmExceptions;
   return true;
@@ -344,7 +344,9 @@ void TryCatchScope::emitCatchBodiesMSVC(IRState &irs, llvm::Value *) {
 ////////////////////////////////////////////////////////////////////////////////
 
 CleanupScope::CleanupScope(llvm::BasicBlock *beginBlock,
-                           llvm::BasicBlock *endBlock) {
+                           llvm::BasicBlock *endBlock,
+                           llvm::BasicBlock *wasmUnwindBB)
+    : wasmUnwindBB(wasmUnwindBB) {
   if (useMSVCEH()) {
     findSuccessors(blocks, beginBlock, endBlock);
     return;
@@ -446,7 +448,7 @@ llvm::BasicBlock *CleanupScope::runCopying(IRState &irs,
     return continueWith;
   if (exitTargets.empty()) {
     if (!endBlock()->getTerminator())
-      // Set up the unconditional branch at the end of the cleanup
+      // Set up the unconditional branch at the end of the cleanup.
       llvm::BranchInst::Create(continueWith, endBlock());
   } else {
     // check whether we have an exit target with the same continuation
@@ -460,7 +462,7 @@ llvm::BasicBlock *CleanupScope::runCopying(IRState &irs,
   // reuse the original IR if not unwinding and not already used
   bool useOriginal = unwindTo == nullptr && funclet == nullptr;
   for (CleanupExitTarget &tgt : exitTargets) {
-    if (tgt.cleanupBlocks.front() == beginBlock()) {
+    if (!tgt.cleanupBlocks.empty() && tgt.cleanupBlocks.front() == beginBlock()) {
       useOriginal = false;
       break;
     }
@@ -487,6 +489,8 @@ llvm::BasicBlock *CleanupScope::runCopying(IRState &irs,
   }
   return exitTarget.cleanupBlocks.front();
 }
+
+////////////////////////////////////////////////////////////////////////////////
 
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -547,8 +551,9 @@ bool TryCatchFinallyScopes::isCatchingNonExceptions() const {
 ////////////////////////////////////////////////////////////////////////////////
 
 void TryCatchFinallyScopes::pushCleanup(llvm::BasicBlock *beginBlock,
-                                        llvm::BasicBlock *endBlock) {
-  cleanupScopes.emplace_back(beginBlock, endBlock);
+                                        llvm::BasicBlock *endBlock,
+                                        llvm::BasicBlock *wasmUnwindBB) {
+  cleanupScopes.emplace_back(beginBlock, endBlock, wasmUnwindBB);
   unresolvedGotosPerCleanupScope.emplace_back();
   landingPadsPerCleanupScope.emplace_back();
 }
@@ -707,8 +712,28 @@ llvm::BasicBlock *TryCatchFinallyScopes::emitLandingPad() {
     return emitLandingPadMSVC(currentCleanupScope() - 1);
   }
 
-  if (useWasmEH())
+  if (useWasmEH()) {
+    // In legacy Wasm EH, a catchswitch with only wasm.rethrow (no matching
+    // catches) generates try/catch 0/rethrow N in wasm.  When rethrow N is
+    // used from inside a catch block, it rethrows using the OUTER catch's
+    // exception context rather than propagating to the enclosing catch_all.
+    // This means exceptions thrown inside a catch body bypass the finally.
+    //
+    // When there are no active catch scopes (only cleanup scopes), skip the
+    // catchswitch entirely and use the cleanup block directly as the landing
+    // pad.  This lets exceptions propagate naturally to catch_all (the finally).
+    if (tryCatchScopes.empty() && currentCleanupScope() > 0) {
+      // Find the innermost cleanup pad to use as unwind destination.
+      CleanupCursor inner = currentCleanupScope();
+      for (CleanupCursor i = inner; i-- > 0;) {
+        llvm::BasicBlock *cpBB = cleanupScopes[i].wasmUnwindBB;
+        if (cpBB)
+          return cpBB;
+      }
+      // No pre-built cleanup pad — fall through to full catchswitch emission.
+    }
     return emitLandingPadWasm();
+  }
 
   // save and rewrite scope
   const auto savedInsertPoint = irs.saveInsertPoint();
@@ -877,13 +902,53 @@ llvm::BasicBlock *TryCatchFinallyScopes::emitLandingPadWasm() {
   llvm::Value *parentPad =
       llvm::ConstantTokenNone::get(irs.context());
 
-  // Unwind destination for the catchswitch: nullptr means "unwind to caller".
-  // TODO: when there are active cleanup scopes enclosing this try/catch (i.e.
-  // a try/finally wrapping a try/catch), we need to thread the catchswitch
-  // unwind destination through the enclosing cleanuppad chain via runCleanupPad,
-  // mirroring emitLandingPadMSVC.  For now we always unwind to caller, which is
-  // correct for the common case of no interleaved finally blocks.
+  // Unwind destination for the catchswitch.
+  // If there are cleanup scopes enclosing this try/catch (e.g. a try/finally
+  // wrapping a try/catch), we must thread the unwind through them so that
+  // finally blocks run when an exception propagates out of a catch body.
+  //
+  // The cleanuppad blocks were pre-built by visit(TryFinallyStatement) via
+  // a second emission of the finally body inside a cleanuppad funclet.
+  // This avoids the domination issues of cloning pre-existing blocks.
+  //
+  // Use currentCleanupScope() so that catch body invokes also unwind through
+  // enclosing finally blocks — in D, finally runs whether try OR catch throws.
+  CleanupCursor innerCleanup = currentCleanupScope();
   llvm::BasicBlock *unwindDest = nullptr;
+  if (innerCleanup > 0) {
+    // Build the chain bottom-up: outermost scope (index 0) first.
+    for (CleanupCursor i = 0; i < innerCleanup; ++i) {
+      llvm::BasicBlock *&cached = getLandingPadRef(i);
+      if (!cached) {
+        llvm::BasicBlock *outerUnwind =
+            (i > 0) ? getLandingPadRef(i - 1) : nullptr;
+        llvm::BasicBlock *cpBB = cleanupScopes[i].wasmUnwindBB;
+
+        if (cpBB && outerUnwind) {
+          // The pre-built cleanuppad was emitted with "unwind to caller".
+          // Replace its cleanupret with one that unwinds to outerUnwind.
+          // setUnwindDest() asserts hasUnwindDest() so we must replace.
+          if (!cpBB->empty() && llvm::isa<llvm::CleanupPadInst>(&cpBB->front())) {
+            auto *cp = llvm::cast<llvm::CleanupPadInst>(&cpBB->front());
+            for (auto *user : llvm::make_early_inc_range(cp->users())) {
+              if (auto *cri = llvm::dyn_cast<llvm::CleanupReturnInst>(user)) {
+                llvm::CleanupReturnInst::Create(cp, outerUnwind, cri);
+                cri->eraseFromParent();
+                break;
+              }
+            }
+          }
+        }
+        cached = cpBB;
+      }
+    }
+    for (CleanupCursor i = innerCleanup; i-- > 0;) {
+      if (getLandingPadRef(i)) {
+        unwindDest = getLandingPadRef(i);
+        break;
+      }
+    }
+  }
 
   // Collect all ClassInfo pointers across all active try-catch scopes
   // (outermost catch clauses first, matching the DWARF landingpad ordering).
@@ -936,22 +1001,10 @@ llvm::BasicBlock *TryCatchFinallyScopes::emitLandingPadWasm() {
   // (which calls _d_eh_enter_catch and runs the user code — all outside the
   // funclet).  On a full mismatch we rethrow inside the funclet.
   //
-  // Also mirror the cleanup interleaving from the DWARF path: if there are
-  // cleanup scopes between two nested try-catch scopes we would need to run
-  // them.  For now we replicate the same structure; cleanup blocks in Wasm EH
-  // should use cleanuppad/cleanupret (i.e. runCleanupPad), but that requires
-  // more infrastructure.  The TODO below marks where that goes.
-  CleanupCursor cleanupForInterleave = currentCleanupScope();
-
+  // Emit the selector comparison chain inside the catchpad funclet.
   for (auto it = tryCatchScopes.rbegin(), end = tryCatchScopes.rend();
        it != end; ++it) {
     const auto &tryCatchScope = *it;
-
-    // TODO: if cleanupForInterleave > tryCatchScope.getCleanupScope(), we need
-    // to run interleaved cleanups here (analogous to the DWARF path's
-    // landingPad->setCleanup(true) + runCleanups block).  For the common case
-    // (no finally between try and catch) this is a no-op.
-    cleanupForInterleave = tryCatchScope.getCleanupScope();
 
     for (const auto &cb : tryCatchScope.getCatchBlocks()) {
       // Compute the typeid for this clause's ClassInfo pointer.
